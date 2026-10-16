@@ -1,0 +1,11 @@
+- insert:
+    - id: crawshrimp-scripts
+      name: dsh-crawshrimp-scripts
+      config:
+        adapterRoots: []
+        workspaceDir: ~/.dsh-crawshrimp-scripts
+        browserChannel: chrome
+        storageStatePath: ''
+        timeoutMs: 120000
+        maxScriptBytes: 524288
+        maxOutputBytes: 2097152

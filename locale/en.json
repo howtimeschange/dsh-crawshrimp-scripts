@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Crawshrimp Scripts",
+    "description": "Run portable ecommerce page scripts directly in isolated Chrome contexts."
+  }
+}
