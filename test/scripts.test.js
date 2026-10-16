@@ -387,7 +387,9 @@ test('real external CDP browser preserves its existing page and context after sc
     if (runtime) await runtime.dispose()
     if (connected) await connected.close()
     await stopChrome(chrome)
-    await rm(profileDir, { recursive: true, force: true })
+    // Chrome's helper processes can finish writing the profile just after
+    // the parent exits. Bound retries to that teardown race.
+    await rm(profileDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
 })
 
