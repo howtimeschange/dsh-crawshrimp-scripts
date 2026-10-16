@@ -1,5 +1,6 @@
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
@@ -7,6 +8,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
+import { chromium } from 'playwright-core'
 import * as plugin from '../lib/index.js'
 import { ScriptsError, ScriptsRuntime } from '../lib/index.js'
 import { discoverAdapters } from '../lib/manifest.js'
@@ -96,14 +98,66 @@ function execution(agent = { id: 'test-agent', session: {} }, signal = new Abort
 }
 
 function runtimeFor(root, workspace, extra = {}, approval = { effectivePolicy: () => 'ask', request: async () => 'allowed-once' }) {
+  const launchConfig = extra.cdpEndpoint ? {} : (chromePath ? { executablePath: chromePath } : {})
   return new ScriptsRuntime({ get: () => approval }, {
     adapterRoots: [root],
     workspaceDir: workspace,
-    ...(chromePath ? { executablePath: chromePath } : {}),
+    ...launchConfig,
     browserChannel: 'chrome',
     timeoutMs: 5000,
     ...extra,
   })
+}
+
+function waitForDevtoolsEndpoint(child, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    let output = ''
+    let settled = false
+    const timer = setTimeout(() => finish(new Error(`Chrome did not report a DevTools endpoint: ${output.slice(-500)}`)), timeoutMs)
+    const finish = (error, endpoint) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (error) reject(error)
+      else resolve(endpoint)
+    }
+    const onOutput = (chunk) => {
+      output += chunk.toString()
+      const match = output.match(/DevTools listening on (ws:\/\/\S+)/)
+      if (!match) return
+      const websocket = new URL(match[1])
+      finish(undefined, `http://${websocket.host}`)
+    }
+    child.stdout?.on('data', onOutput)
+    child.stderr?.on('data', onOutput)
+    child.once('error', (error) => finish(error))
+    child.once('exit', (code, signal) => finish(new Error(`Chrome exited before DevTools startup (code=${code}, signal=${signal})`)))
+  })
+}
+
+async function waitForDevtoolsVersion(endpoint, timeoutMs = 10000) {
+  const url = new URL('/json/version', endpoint)
+  const deadline = Date.now() + timeoutMs
+  let lastError
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(url)
+      if (response.ok) return response.json()
+      lastError = new Error(`DevTools returned HTTP ${response.status}`)
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  throw lastError || new Error('DevTools endpoint did not become ready')
+}
+
+async function stopChrome(child) {
+  if (!child || (child.exitCode !== null && child.exitCode !== undefined) || child.signalCode) return
+  const exited = new Promise((resolve) => child.once('exit', resolve))
+  child.kill('SIGTERM')
+  await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 3000))])
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
 }
 
 test('manifest discovery ignores unrelated directories and returns the portable adapter', async (t) => {
@@ -207,11 +261,19 @@ test('approval fails closed, accepts one-shot approval and is interrupted by dis
   const root = await tempDir(t)
   const workspace = await tempDir(t, 'dsh-scripts-workspace-')
   await createAdapter(t, root)
-  const neverRuntime = runtimeFor(root, workspace, {}, { effectivePolicy: () => 'never', request: async () => 'allowed-once' })
+  let neverRequests = 0
+  const neverRuntime = runtimeFor(root, workspace, {}, {
+    effectivePolicy: () => 'never',
+    request: async () => {
+      neverRequests += 1
+      return 'rejected'
+    },
+  })
   await assert.rejects(
     neverRuntime.run({ adapter_id: 'fixture-adapter', task_id: 'read-table' }, execution()),
     (error) => error instanceof ScriptsError && error.code === 'APPROVAL_REQUIRED',
   )
+  assert.equal(neverRequests, 1)
   await neverRuntime.dispose()
 
   const paramsRuntime = runtimeFor(root, workspace)
@@ -252,6 +314,81 @@ test('artifact writing rejects a workspace symlink escape and preserves existing
     (error) => error instanceof ScriptsError && error.code === 'ARTIFACT_WRITE_FAILED',
   )
   assert.deepEqual(await readdir(outside), [])
+})
+
+test('artifact writing cancels before publication and removes temporary files', async (t) => {
+  const workspace = await tempDir(t, 'dsh-scripts-workspace-')
+  const runtime = new ScriptsRuntime({ get: () => undefined }, { workspaceDir: workspace })
+  const controller = new AbortController()
+  const originalThrowIfAborted = controller.signal.throwIfAborted.bind(controller.signal)
+  let checks = 0
+  controller.signal.throwIfAborted = () => {
+    checks += 1
+    if (checks === 3) controller.abort()
+    originalThrowIfAborted()
+  }
+
+  await assert.rejects(
+    runtime.writeArtifact({ id: 'fixture-adapter' }, { id: 'read-table' }, JSON.stringify({ ok: true }), controller.signal),
+    (error) => error instanceof ScriptsError && error.code === 'ABORTED',
+  )
+  const artifactDir = path.join(workspace, 'artifacts', 'fixture-adapter', 'read-table')
+  assert.deepEqual(await readdir(artifactDir), [])
+})
+
+test('real external CDP browser preserves its existing page and context after scripts run', { skip: !chromePath }, async (t) => {
+  const root = await tempDir(t)
+  const workspace = await tempDir(t, 'dsh-scripts-workspace-')
+  await createAdapter(t, root)
+  const profileDir = await mkdtemp(path.join(tmpdir(), 'dsh-scripts-cdp-'))
+  const chrome = spawn(chromePath, [
+    '--headless=new',
+    '--disable-gpu',
+    '--disable-dev-shm-usage',
+    '--no-sandbox',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--remote-allow-origins=*',
+    '--remote-debugging-address=127.0.0.1',
+    '--remote-debugging-port=0',
+    `--user-data-dir=${profileDir}`,
+    'about:blank',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let connected
+  let runtime
+  try {
+    const endpoint = await waitForDevtoolsEndpoint(chrome)
+    const version = await waitForDevtoolsVersion(endpoint)
+    assert.match(version.Browser, /Chrome|Chromium/i)
+
+    connected = await chromium.connectOverCDP(endpoint)
+    const externalContext = connected.contexts()[0]
+    assert.ok(externalContext)
+    const externalPage = externalContext.pages()[0] || await externalContext.newPage()
+    await externalPage.goto(`${baseUrl}/?external=before`)
+    assert.equal(await externalPage.title(), 'DSH scripts fixture')
+    assert.equal(await externalPage.locator('table').count(), 1)
+
+    runtime = runtimeFor(root, workspace, { cdpEndpoint: endpoint })
+    const result = await runtime.run({ adapter_id: 'fixture-adapter', task_id: 'read-table', params: {} }, execution())
+    assert.equal(result.success, true)
+    assert.equal(result.data[0].rows[1][0], 'shirt')
+    assert.equal(externalContext.pages().includes(externalPage), true)
+    assert.equal(await externalPage.url(), `${baseUrl}/?external=before`)
+
+    await runtime.dispose()
+    runtime = undefined
+    const afterDispose = await waitForDevtoolsVersion(endpoint)
+    assert.match(afterDispose.Browser, /Chrome|Chromium/i)
+    assert.equal(await externalPage.title(), 'DSH scripts fixture')
+    await externalPage.goto(`${baseUrl}/?external=after`)
+    assert.equal(await externalPage.title(), 'DSH scripts fixture')
+  } finally {
+    if (runtime) await runtime.dispose()
+    if (connected) await connected.close()
+    await stopChrome(chrome)
+    await rm(profileDir, { recursive: true, force: true })
+  }
 })
 
 test('real Cordis and ToolRuntime register both tools and unload removes both', { skip: !chromePath }, async (t) => {
