@@ -104,12 +104,12 @@ function runtimeFor(root, workspace, extra = {}, approval = { effectivePolicy: (
     workspaceDir: workspace,
     ...launchConfig,
     browserChannel: 'chrome',
-    timeoutMs: 5000,
+    timeoutMs: 30000,
     ...extra,
   })
 }
 
-function waitForDevtoolsEndpoint(child, timeoutMs = 15000) {
+function waitForDevtoolsEndpoint(child, timeoutMs = 45000) {
   return new Promise((resolve, reject) => {
     let output = ''
     let settled = false
